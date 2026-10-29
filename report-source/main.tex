@@ -1,0 +1,277 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{awsorange}{HTML}{C45500}
+\definecolor{codebg}{HTML}{F5F5F5}
+\definecolor{codeframe}{HTML}{CCCCCC}
+
+% ---------- Headings ----------
+\titleformat{\section}{\Large\bfseries\color{awsorange}}{\thesection}{0.6em}{}[\titlerule]
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.6em}{}
+\titlespacing*{\section}{0pt}{16pt}{8pt}
+
+% ---------- Header / footer ----------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small Highly Available, Auto-Scaled Web Application on AWS}
+\fancyhead[R]{\small Mosab Kamal}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+
+\setlist{itemsep=2pt,topsep=4pt}
+\captionsetup{font=small,labelfont=bf}
+
+% ---------- Code style ----------
+\lstdefinestyle{shell}{
+  backgroundcolor=\color{codebg},
+  frame=single,
+  rulecolor=\color{codeframe},
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  showstringspaces=false,
+  columns=fullflexible,
+  xleftmargin=0pt,
+  aboveskip=8pt,
+  belowskip=8pt
+}
+\lstset{style=shell}
+
+% ---------- Screenshot helper (shows a placeholder if the file is missing) ----------
+\newcommand{\shot}[2]{%
+  \begin{figure}[H]
+    \centering
+    \IfFileExists{#1.png}{%
+      \includegraphics[width=0.92\linewidth]{#1.png}%
+    }{%
+      \fbox{\parbox{0.85\linewidth}{\centering\vspace{1.6cm}\textit{Insert image: #1.png}\vspace{1.6cm}}}%
+    }
+    \caption{#2}
+  \end{figure}%
+}
+
+\begin{document}
+
+% ---------- Title ----------
+\begin{center}
+  {\Huge\bfseries\color{awsorange} Highly Available, Auto-Scaled\\[4pt] Web Application on AWS}\\[14pt]
+  {\large Design, Deployment, and Hardening of a Multi-Tier Architecture in a Custom VPC}\\[14pt]
+  \textbf{Mosab Kamal}\\
+  Zewail City of Science and Technology\\[4pt]
+
+\end{center}
+
+\vspace{6pt}
+\hrule
+\vspace{10pt}
+
+\begin{abstract}
+\noindent
+This report documents the design and deployment of a highly available, auto-scaled web application on Amazon Web Services. The solution is built inside a custom VPC that spans two Availability Zones, with web servers placed in private subnets, public traffic served through an Application Load Balancer, and outbound access provided by one NAT Gateway per Availability Zone. Instance management uses AWS Systems Manager (SSM) instead of SSH keys, and the security groups are restricted following the principle of least privilege. The report covers the architecture, implementation steps, verification, security decisions, and cleanup.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =====================================================
+\section{Overview}
+\subsection{Objective}
+The goal of the project was to build a web tier that stays available if a whole Availability Zone fails, scales with demand, and is not directly reachable from the internet. Only the load balancer is exposed publicly.
+
+\subsection{Technologies Used}
+\begin{itemize}
+  \item \textbf{Networking:} VPC, subnets, route tables, Internet Gateway, NAT Gateways, Elastic IPs
+  \item \textbf{Compute:} EC2 (Amazon Linux 2023, \texttt{t2.micro}), Launch Template, Auto Scaling Group
+  \item \textbf{Load balancing:} Application Load Balancer, Target Group
+  \item \textbf{Security and access:} Security Groups, IAM role, AWS Systems Manager (Session Manager)
+\end{itemize}
+
+% =====================================================
+\section{Architecture}
+\subsection{Design Summary}
+The VPC uses the CIDR block \texttt{10.0.0.0/16} and is divided into public and private subnets across two Availability Zones (\texttt{us-east-1a} and \texttt{us-east-1b}). The public subnets host the load balancer and the NAT Gateways. The private subnets host the web servers.
+
+\shot{architecture-diagram}{Architecture diagram of the deployed solution}
+
+\subsection{Network Layout}
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{l l l X}
+\toprule
+\textbf{Subnet} & \textbf{AZ} & \textbf{CIDR} & \textbf{Purpose} \\
+\midrule
+Public\_Subnet1  & us-east-1a & 10.0.10.0/24  & ALB node, NAT Gateway A \\
+Public\_Subnet2  & us-east-1b & 10.0.20.0/24  & ALB node, NAT Gateway B \\
+Private\_Subnet1 & us-east-1a & 10.0.100.0/24 & Web servers (AZ A) \\
+Private\_Subnet2 & us-east-1b & 10.0.200.0/24 & Web servers (AZ B) \\
+\bottomrule
+\end{tabularx}
+\caption{Subnet plan}
+\end{table}
+
+\subsection{Routing}
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{l l l X}
+\toprule
+\textbf{Route table} & \textbf{Destination} & \textbf{Target} & \textbf{Associated with} \\
+\midrule
+Public\_RT    & 10.0.0.0/16 & local & Both public subnets \\
+              & 0.0.0.0/0   & Internet Gateway & \\
+Private\_RT\_1 & 10.0.0.0/16 & local & Private\_Subnet1 \\
+              & 0.0.0.0/0   & NAT Gateway A & \\
+Private\_RT\_2 & 10.0.0.0/16 & local & Private\_Subnet2 \\
+              & 0.0.0.0/0   & NAT Gateway B & \\
+\bottomrule
+\end{tabularx}
+\caption{Route tables}
+\end{table}
+
+\paragraph{Why two private route tables?}
+Each private subnet routes through the NAT Gateway in its own Availability Zone. If one zone fails, the other zone keeps its outbound path, so the NAT layer is not a single point of failure. A single shared private route table would force both zones through one NAT Gateway.
+
+% =====================================================
+\section{Implementation}
+
+\subsection{Step 1: VPC and Subnets}
+\begin{enumerate}
+  \item Created the custom VPC with CIDR \texttt{10.0.0.0/16} and enabled DNS hostnames.
+  \item Created an Internet Gateway and attached it to the VPC.
+  \item Created the two public and two private subnets according to the plan above.
+  \item Enabled auto-assign public IPv4 on the public subnets.
+  \item Created \texttt{Public\_RT}, added a default route to the Internet Gateway, and associated it with both public subnets.
+\end{enumerate}
+
+
+\subsection{Step 2: NAT Gateways}
+One public NAT Gateway was created in each public subnet, each with its own Elastic IP. Then \texttt{Private\_RT\_1} and \texttt{Private\_RT\_2} were created, each with a default route to the NAT Gateway of the same Availability Zone.
+
+
+\subsection{Step 3: IAM Role for Systems Manager}
+An IAM role named \texttt{ec2tossm} was created for EC2 with the AWS managed policy \texttt{AmazonSSMManagedInstanceCore}. This allows administrators to open shell sessions through Session Manager, so no SSH key pair or inbound SSH rule is needed.
+\subsection{Step 4: Web Servers}
+Two EC2 instances (\texttt{Web\_Server1}, \texttt{Web\_Server2}) were launched, one in each private subnet, using Amazon Linux 2023 and the \texttt{ec2tossm} instance profile, without an SSH key. The following user data installs Apache and publishes a test page:
+
+\begin{lstlisting}[language=bash]
+#!/bin/bash
+yum update -y
+yum install httpd -y
+systemctl start httpd
+systemctl enable httpd
+echo "This is server 1 in us-east-1a" > /var/www/html/index.html
+\end{lstlisting}
+
+After launch, I connected through Session Manager, confirmed that Apache was active with \texttt{systemctl status httpd}, and tested the page locally with \texttt{curl}.
+
+
+\subsection{Step 5: Application Load Balancer}
+\begin{itemize}
+  \item Created the target group \texttt{WebTG} (HTTP, port 80) and registered both instances. Health check thresholds were reduced to detect failures faster.
+  \item Created the security group \texttt{ALBSG} allowing inbound HTTP from anywhere.
+  \item Created the internet-facing load balancer \texttt{WebALB} across both public subnets, forwarding to \texttt{WebTG}.
+\end{itemize}
+Once both targets reported healthy, the ALB DNS name returned the page from the servers.
+
+
+\subsection{Step 6: Launch Template and Auto Scaling Group}
+A launch template was created with the same AMI, instance type, security group, IAM profile, and a user data script that installs Apache. An Auto Scaling Group named \texttt{ASG} was then created across both private subnets and attached to \texttt{WebTG}, with ELB health checks enabled.
+
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{l c}
+\toprule
+\textbf{Setting} & \textbf{Value} \\
+\midrule
+Minimum capacity & 2 \\
+Desired capacity & 4 \\
+Maximum capacity & 6 \\
+Health check type & ELB \\
+\bottomrule
+\end{tabular}
+\caption{Auto Scaling Group configuration}
+\end{table}
+
+After the ASG launched four instances spread across both zones and they became healthy, the two manually created instances were terminated. The ASG now owns instance lifecycle and replaces any failed instance automatically.
+
+
+\subsection{Step 7: Security Hardening}
+Initially \texttt{WebSG} allowed HTTP from anywhere, which was necessary for the first tests. It was then tightened:
+\begin{itemize}
+  \item \texttt{WebSG} inbound: HTTP (80) \textbf{only from \texttt{ALBSG}}.
+  \item \texttt{ALBSG} outbound: HTTP (80) \textbf{only to \texttt{WebSG}}.
+\end{itemize}
+After the change, the application was still reachable through the ALB, while direct access to the instances was impossible because they have no public IPs and accept traffic only from the load balancer.
+
+
+% =====================================================
+\section{Verification}
+\begin{table}[H]
+\centering
+\renewcommand{\arraystretch}{1.25}
+\begin{tabularx}{\linewidth}{l X}
+\toprule
+\textbf{Test} & \textbf{Result} \\
+\midrule
+Open ALB DNS name in a browser & Page served from a private instance \\
+Refresh repeatedly & Responses come from instances in different zones \\
+Target group status & All targets healthy \\
+Terminate one ASG instance & ASG launches a replacement automatically \\
+Access via Session Manager & Works without SSH or public IP \\
+After SG lockdown & Application still reachable through the ALB \\
+\bottomrule
+\end{tabularx}
+\caption{Verification summary}
+\end{table}
+
+
+% =====================================================
+\section{Design Decisions}
+\begin{itemize}
+  \item \textbf{Private subnets for servers:} instances have no public IP and are not directly exposed.
+  \item \textbf{One NAT Gateway per AZ:} removes a cross-zone single point of failure, at a higher cost.
+  \item \textbf{Session Manager instead of SSH:} no open management port, no key distribution, and access is controlled through IAM.
+  \item \textbf{Security group chaining:} instances trust only the load balancer's security group rather than an IP range.
+  \item \textbf{ELB health checks in the ASG:} an instance that fails the application-level check is replaced, not just one that fails at the OS level.
+\end{itemize}
+
+\newpage
+% =====================================================
+\section{Cleanup and Cost}
+NAT Gateways, Elastic IPs, and the Application Load Balancer are billed while they exist, even without traffic, so all resources were removed after testing, in this order:
+\begin{enumerate}
+  \item Delete the NAT Gateways
+  \item Delete the Auto Scaling Group
+  \item Release the Elastic IP addresses
+  \item Terminate any remaining EC2 instances
+  \item Delete the load balancer and target group
+  \item Delete the custom VPC
+\end{enumerate}
+Billing was checked afterward to confirm that nothing was left running.
+
+% =====================================================
+\section{Lessons Learned and Future Work}
+\begin{itemize}
+  \item Health check settings strongly affect how quickly failures are detected and recovered.
+  \item Per-AZ route tables are required to get real fault tolerance from NAT Gateways.
+  \item Possible improvements: HTTPS with an ACM certificate, target-tracking scaling policies, a database tier in the reserved private subnets, VPC endpoints to reduce NAT usage, and Infrastructure as Code (Terraform or CloudFormation) for repeatable deployment.
+\end{itemize}
+
+\end{document}
